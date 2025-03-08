@@ -1,0 +1,124 @@
+pipeline {
+    agent any
+    environment {
+        TF_VAR_region = "${env.DEPLOY_REGION ?: 'eu-west-2'}" // Default region, override via env vars
+    }
+    stages {
+        stage('Set Environment') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME.startsWith('PR-')) {
+                        echo "Running for Pull Request: ${env.BRANCH_NAME}"
+                        env.ENV_FILE = 'dev.tfvars'
+                        env.DEPLOY_REGION = env.DEPLOY_REGION ?: 'eu-west-2' // Customizable region
+                        env.BUCKET_NAME = env.BUCKET_NAME ?: 'my-static-site-bucket-dev' // Generic default
+                        env.DEPLOY_ENV = 'dev'
+                    } else if (env.BRANCH_NAME == 'main') {
+                        echo "Running for Main branch: ${env.BRANCH_NAME}"
+                        env.ENV_FILE = 'prod.tfvars'
+                        env.DEPLOY_REGION = env.DEPLOY_REGION ?: 'eu-west-2'
+                        env.BUCKET_NAME = env.BUCKET_NAME ?: 'my-static-site-bucket-prod'
+                        env.DEPLOY_ENV = 'prod'
+                    } else {
+                        error("Branch ${env.BRANCH_NAME} is not configured for this pipeline!")
+                    }
+                }
+            }
+        }
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+            }
+        }
+        stage('Terraform Init') {
+            steps {
+                dir('terraform') {
+                    sh """
+                        terraform init \
+                        -backend-config="bucket=${env.TF_STATE_BUCKET ?: 'my-tf-state-bucket'}" \
+                        -backend-config="region=${env.DEPLOY_REGION}" \
+                        -backend-config="key=static-site/${env.DEPLOY_ENV}/terraform.tfstate"
+                    """
+                }
+            }
+        }
+        stage('Terraform Plan') {
+            steps {
+                dir('terraform') {
+                    sh "terraform plan -var-file=${env.ENV_FILE} -out=tfplan"
+                }
+            }
+        }
+        stage('Check Deployment Manifest') {
+            steps {
+                script {
+                    def manifest = readJSON file: 'manifest.json'
+                    env.DEPLOY_ENABLED = manifest.deploy[env.DEPLOY_ENV].toString()
+                    echo "Deployment enabled for ${env.DEPLOY_ENV}: ${env.DEPLOY_ENABLED}"
+                }
+            }
+        }
+        stage('Terraform Apply') {
+            when {
+                allOf {
+                    anyOf {
+                        branch 'main'
+                        expression { env.BRANCH_NAME.contains('PR-') }
+                    }
+                    expression { env.DEPLOY_ENABLED == 'true' }
+                }
+            }
+            steps {
+                dir('terraform') {
+                    sh "terraform apply -auto-approve tfplan"
+                }
+            }
+        }
+        stage('Upload index.html') {
+            when {
+                allOf {
+                    anyOf {
+                        branch 'main'
+                        expression { env.BRANCH_NAME.contains('PR-') }
+                    }
+                    expression { env.DEPLOY_ENABLED == 'true' }
+                }
+            }
+            steps {
+                dir('src') {
+                    sh """
+                        aws s3 cp index.html s3://${env.BUCKET_NAME}/index.html
+                    """
+                }
+            }
+        }
+        stage('Tag Release') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { env.DEPLOY_ENABLED == 'true' }
+                }
+            }
+            steps {
+                script {
+                    def changelog = readFile('changelog.md')
+                    def version = changelog.find(/## \[(\d+\.\d+\.\d+)\]/) { match, v -> "v${v}" }
+                    if (version) {
+                        echo "Tagging release: ${version}"
+                        sh """
+                            git tag -a ${version} -m "Release ${version}: See changelog for details"
+                            git push origin ${version}
+                        """
+                    } else {
+                        echo "No version found in changelog.md to tag."
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo "Pipeline execution completed for environment using ${env.ENV_FILE}"
+        }
+    }
+}
